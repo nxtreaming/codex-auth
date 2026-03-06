@@ -1,11 +1,11 @@
-# Codex Auth (local-only)
+# Codex Auth
 
 ![command list](https://github.com/user-attachments/assets/7bbd463b-c5ed-4b90-b1f6-8dfbf21a8944)
 
-This project provides a single Zig tool: `codex-auth`, a local-only ChatGPT account manager for Codex.
+`codex-auth` is a local-only command-line tool for switching Codex accounts.
 
-- It never calls OpenAI APIs, so it does not affect your OpenAI account security through remote API requests.
-- All data is read locally from Codex files under `~/.codex` (including `sessions/` and related auth files).
+- It never calls OpenAI APIs; all operations happen locally on your machine.
+- It reads and updates local Codex files under `~/.codex` (including `sessions/` and auth files).
 
 ## Full Commands
 
@@ -51,12 +51,12 @@ codex-auth switch               # arrow + number input
 
 ![command switch](https://github.com/user-attachments/assets/48a86acf-2a6e-4206-a8c4-591989fdc0df)
 
-
 Switch account non-interactively (for scripts/other CLIs):
 
 ```shell
 codex-auth switch user
 ```
+
 If multiple accounts match, interactive selection is shown.
 
 Remove accounts (interactive multi-select):
