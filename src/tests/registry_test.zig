@@ -327,7 +327,25 @@ test "plan labels are human-readable while registry stores raw plan values" {
     try std.testing.expectEqualStrings("Free", registry.planLabel(.free));
     try std.testing.expectEqualStrings("Plus", registry.planLabel(.plus));
     try std.testing.expectEqualStrings("Pro Lite", registry.planLabel(.prolite));
-    try std.testing.expectEqualStrings("Team", registry.planLabel(.team));
+    try std.testing.expectEqualStrings("Business", registry.planLabel(.team));
+}
+
+test "resolveDisplayPlan prefers a usage snapshot plan over the stored auth plan" {
+    const gpa = std.testing.allocator;
+    var reg = makeEmptyRegistry();
+    defer reg.deinit(gpa);
+
+    var rec = try makeAccountRecord(gpa, "display@example.com", "", .plus, .chatgpt, 1);
+    rec.last_usage = .{
+        .primary = null,
+        .secondary = null,
+        .credits = null,
+        .plan_type = .team,
+    };
+    try reg.accounts.append(gpa, rec);
+
+    try std.testing.expectEqual(registry.PlanType.plus, registry.resolvePlan(&reg.accounts.items[0]).?);
+    try std.testing.expectEqual(registry.PlanType.team, registry.resolveDisplayPlan(&reg.accounts.items[0]).?);
 }
 
 test "registry load defaults missing account_name field to null" {

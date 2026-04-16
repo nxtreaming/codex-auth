@@ -124,8 +124,8 @@ fn lessThanByDisplayOrder(ctx: SortContext, lhs: usize, rhs: usize) bool {
     const b_active = isActive(reg, rhs);
     if (a_active != b_active) return a_active;
 
-    const a_rank = planSortRank(registry.resolvePlan(a));
-    const b_rank = planSortRank(registry.resolvePlan(b));
+    const a_rank = planSortRank(registry.resolveDisplayPlan(a));
+    const b_rank = planSortRank(registry.resolveDisplayPlan(b));
     if (a_rank != b_rank) return a_rank < b_rank;
 
     const a_plan = displayPlan(a);
@@ -145,7 +145,7 @@ fn planSortRank(plan: ?registry.PlanType) u8 {
 }
 
 fn displayPlan(rec: *const registry.AccountRecord) []const u8 {
-    return if (registry.resolvePlan(rec)) |plan| registry.planLabel(plan) else "-";
+    return if (registry.resolveDisplayPlan(rec)) |plan| registry.planLabel(plan) else "-";
 }
 
 fn isActive(reg: *const registry.Registry, account_idx: usize) bool {

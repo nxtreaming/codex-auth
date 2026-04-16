@@ -84,13 +84,20 @@ pub fn resolvePlan(rec: *const AccountRecord) ?PlanType {
     return null;
 }
 
+pub fn resolveDisplayPlan(rec: *const AccountRecord) ?PlanType {
+    if (rec.last_usage) |u| {
+        if (u.plan_type) |p| return p;
+    }
+    return resolvePlan(rec);
+}
+
 pub fn planLabel(plan: PlanType) []const u8 {
     return switch (plan) {
         .free => "Free",
         .plus => "Plus",
         .prolite => "Pro Lite",
         .pro => "Pro",
-        .team => "Team",
+        .team => "Business",
         .business => "Business",
         .enterprise => "Enterprise",
         .edu => "Edu",

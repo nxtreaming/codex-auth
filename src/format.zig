@@ -19,7 +19,7 @@ fn colorEnabled() bool {
 }
 
 fn planDisplay(rec: *const registry.AccountRecord, missing: []const u8) []const u8 {
-    if (registry.resolvePlan(rec)) |p| return registry.planLabel(p);
+    if (registry.resolveDisplayPlan(rec)) |p| return registry.planLabel(p);
     return missing;
 }
 
@@ -749,3 +749,26 @@ test "writeAccountsTable shows usage override statuses for failed refreshes" {
     const output = writer.buffered();
     try std.testing.expect(std.mem.count(u8, output, "403") >= 2);
 }
+
+test "writeAccountsTable prefers usage snapshot plan labels over stored auth plan" {
+    const gpa = std.testing.allocator;
+    var reg = makeTestRegistry();
+    defer reg.deinit(gpa);
+
+    try appendTestAccount(gpa, &reg, "user-1::acc-1", "user@example.com", "", .plus);
+    reg.accounts.items[0].last_usage = .{
+        .primary = null,
+        .secondary = null,
+        .credits = null,
+        .plan_type = .team,
+    };
+
+    var buffer: [2048]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try writeAccountsTable(&writer, &reg, false);
+
+    const output = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, output, "Business") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Plus") == null);
+}
+

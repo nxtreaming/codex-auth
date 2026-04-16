@@ -57,9 +57,9 @@ test "Scenario: Given same email with two team accounts and one plus account whe
     try std.testing.expect(rows.rows.len == 4);
     try std.testing.expect(rows.rows[0].account_index == null);
     try std.testing.expect(std.mem.eql(u8, rows.rows[0].account_cell, "user@example.com"));
-    try std.testing.expect(std.mem.eql(u8, rows.rows[1].account_cell, "Team #1"));
+    try std.testing.expect(std.mem.eql(u8, rows.rows[1].account_cell, "Business #1"));
     try std.testing.expect(rows.rows[1].is_active);
-    try std.testing.expect(std.mem.eql(u8, rows.rows[2].account_cell, "Team #2"));
+    try std.testing.expect(std.mem.eql(u8, rows.rows[2].account_cell, "Business #2"));
     try std.testing.expect(std.mem.eql(u8, rows.rows[3].account_cell, "Plus"));
     try std.testing.expect(rows.selectable_row_indices.len == 3);
 }
@@ -93,8 +93,31 @@ test "Scenario: Given grouped accounts with a prolite record when building displ
 
     try std.testing.expectEqual(@as(usize, 3), rows.rows.len);
     try std.testing.expect(std.mem.eql(u8, rows.rows[0].account_cell, "user@example.com"));
-    try std.testing.expect(std.mem.eql(u8, rows.rows[1].account_cell, "Team"));
+    try std.testing.expect(std.mem.eql(u8, rows.rows[1].account_cell, "Business"));
     try std.testing.expect(std.mem.eql(u8, rows.rows[2].account_cell, "Pro Lite"));
+}
+
+test "Scenario: Given a grouped account with a fresher usage plan when building display rows then labels and ordering prefer the usage plan" {
+    const gpa = std.testing.allocator;
+    var reg = makeRegistry();
+    defer reg.deinit(gpa);
+
+    try appendAccount(gpa, &reg, "user-ESYgcy2QkOGZc0NoxSlFCeVT::67fe2bbb-0de6-49a4-b2b3-d1df366d1faf", "user@example.com", "", .plus);
+    reg.accounts.items[0].last_usage = .{
+        .primary = null,
+        .secondary = null,
+        .credits = null,
+        .plan_type = .team,
+    };
+    try appendAccount(gpa, &reg, "user-ESYgcy2QkOGZc0NoxSlFCeVT::518a44d9-ba75-4bad-87e5-ae9377042960", "user@example.com", "", .free);
+
+    var rows = try display_rows.buildDisplayRows(gpa, &reg, null);
+    defer rows.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 3), rows.rows.len);
+    try std.testing.expect(std.mem.eql(u8, rows.rows[0].account_cell, "user@example.com"));
+    try std.testing.expect(std.mem.eql(u8, rows.rows[1].account_cell, "Business"));
+    try std.testing.expect(std.mem.eql(u8, rows.rows[2].account_cell, "Free"));
 }
 
 test "Scenario: Given same-email accounts filtered down to one row when building display rows then singleton is decided from the rendered subset" {

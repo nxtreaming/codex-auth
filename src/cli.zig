@@ -1910,7 +1910,7 @@ fn buildSwitchRowsWithUsageOverrides(
     for (display.rows, 0..) |display_row, i| {
         if (display_row.account_index) |account_idx| {
             const rec = reg.accounts.items[account_idx];
-            const plan = if (registry.resolvePlan(&rec)) |p| registry.planLabel(p) else "-";
+            const plan = if (registry.resolveDisplayPlan(&rec)) |p| registry.planLabel(p) else "-";
             const rate_5h = resolveRateWindow(rec.last_usage, 300, true);
             const rate_week = resolveRateWindow(rec.last_usage, 10080, false);
             const usage_override = usageOverrideForAccount(usage_overrides, account_idx);
@@ -1984,7 +1984,7 @@ fn buildSwitchRowsFromIndicesWithUsageOverrides(
     for (display.rows, 0..) |display_row, i| {
         if (display_row.account_index) |account_idx| {
             const rec = reg.accounts.items[account_idx];
-            const plan = if (registry.resolvePlan(&rec)) |p| registry.planLabel(p) else "-";
+            const plan = if (registry.resolveDisplayPlan(&rec)) |p| registry.planLabel(p) else "-";
             const rate_5h = resolveRateWindow(rec.last_usage, 300, true);
             const rate_week = resolveRateWindow(rec.last_usage, 10080, false);
             const usage_override = usageOverrideForAccount(usage_overrides, account_idx);
@@ -2246,3 +2246,23 @@ test "Scenario: Given usage overrides when rendering switch list then failed row
     const output = writer.buffered();
     try std.testing.expect(std.mem.count(u8, output, "401") >= 2);
 }
+
+test "Scenario: Given a usage snapshot plan when building switch rows then the displayed plan prefers it over the stored auth plan" {
+    const gpa = std.testing.allocator;
+    var reg = makeTestRegistry();
+    defer reg.deinit(gpa);
+
+    try appendTestAccount(gpa, &reg, "user-1::acc-1", "user@example.com", "", .plus);
+    reg.accounts.items[0].last_usage = .{
+        .primary = null,
+        .secondary = null,
+        .credits = null,
+        .plan_type = .team,
+    };
+
+    var rows = try buildSwitchRows(gpa, &reg);
+    defer rows.deinit(gpa);
+
+    try std.testing.expectEqualStrings("Business", rows.items[0].plan);
+}
+
