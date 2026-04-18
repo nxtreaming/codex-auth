@@ -1,4 +1,6 @@
 const std = @import("std");
+const time_compat = @import("compat_time.zig");
+const fs = @import("compat_fs.zig");
 const builtin = @import("builtin");
 const display_rows = @import("display_rows.zig");
 const registry = @import("registry.zig");
@@ -15,7 +17,7 @@ const ansi = struct {
 };
 
 fn colorEnabled() bool {
-    return std.fs.File.stdout().isTty();
+    return fs.File.stdout().isTty();
 }
 
 fn planDisplay(rec: *const registry.AccountRecord, missing: []const u8) []const u8 {
@@ -88,7 +90,7 @@ fn writeAccountsTableWithUsageOverrides(
         headers[3].len,
         headers[4].len,
     };
-    const now = std.time.timestamp();
+    const now = time_compat.timestamp();
     var display = try display_rows.buildDisplayRows(std.heap.page_allocator, reg, null);
     defer display.deinit(std.heap.page_allocator);
     const idx_width = @max(@as(usize, 2), indexWidth(display.selectable_row_indices.len));
@@ -306,7 +308,7 @@ fn resetPartsAlloc(reset_at: i64, now: i64) !ResetParts {
 fn formatRateLimitFullAlloc(window: ?registry.RateLimitWindow) ![]u8 {
     if (window == null) return try std.fmt.allocPrint(std.heap.page_allocator, "-", .{});
     if (window.?.resets_at == null) return try std.fmt.allocPrint(std.heap.page_allocator, "-", .{});
-    const now = std.time.timestamp();
+    const now = time_compat.timestamp();
     const reset_at = window.?.resets_at.?;
     if (now >= reset_at) {
         return try std.fmt.allocPrint(std.heap.page_allocator, "100%", .{});
@@ -323,7 +325,7 @@ fn formatRateLimitFullAlloc(window: ?registry.RateLimitWindow) ![]u8 {
 fn formatRateLimitUiAlloc(window: ?registry.RateLimitWindow, width: usize) ![]u8 {
     if (window == null) return try std.fmt.allocPrint(std.heap.page_allocator, "-", .{});
     if (window.?.resets_at == null) return try std.fmt.allocPrint(std.heap.page_allocator, "-", .{});
-    const now = std.time.timestamp();
+    const now = time_compat.timestamp();
     const reset_at = window.?.resets_at.?;
     if (now >= reset_at) {
         return try std.fmt.allocPrint(std.heap.page_allocator, "100%", .{});
@@ -591,15 +593,16 @@ fn tableTotalWidth(widths: []const usize) usize {
 }
 
 fn terminalWidth() usize {
-    const stdout_file = std.fs.File.stdout();
+    const stdout_file = fs.File.stdout();
     if (!stdout_file.isTty()) return 0;
 
     if (comptime builtin.os.tag == .windows) {
-        var info: std.os.windows.CONSOLE_SCREEN_BUFFER_INFO = undefined;
-        if (std.os.windows.kernel32.GetConsoleScreenBufferInfo(stdout_file.handle, &info) == std.os.windows.FALSE) {
-            return 0;
+        var get_console_info = std.os.windows.CONSOLE.USER_IO.GET_SCREEN_BUFFER_INFO;
+        switch (get_console_info.operate(fs.io(), stdout_file.toIoFile()) catch return 0) {
+            .SUCCESS => {},
+            else => return 0,
         }
-        const width = @as(i32, info.srWindow.Right) - @as(i32, info.srWindow.Left) + 1;
+        const width = @as(i32, get_console_info.Data.dwWindowSize.X);
         if (width <= 0) return 0;
         return @as(usize, @intCast(width));
     } else {
@@ -701,7 +704,7 @@ test "truncateAlloc respects max_len" {
 }
 
 test "formatRateLimitFullAlloc shows 100% after reset instead of dash-prefixed value" {
-    const now = std.time.timestamp();
+    const now = time_compat.timestamp();
     const window = registry.RateLimitWindow{
         .used_percent = 100.0,
         .window_minutes = 300,
@@ -771,4 +774,3 @@ test "writeAccountsTable prefers usage snapshot plan labels over stored auth pla
     try std.testing.expect(std.mem.indexOf(u8, output, "Business") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Plus") == null);
 }
-

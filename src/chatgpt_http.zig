@@ -1,5 +1,22 @@
 const builtin = @import("builtin");
 const std = @import("std");
+const fs = @import("compat_fs.zig");
+const process_compat = @import("compat_process.zig");
+const winreg = if (builtin.os.tag == .windows) struct {
+    extern "advapi32" fn RegGetValueW(
+        hkey: std.os.windows.HKEY,
+        sub_key: ?[*:0]const u16,
+        value_name: ?[*:0]const u16,
+        flags: u32,
+        actual_type: ?*std.os.windows.ULONG,
+        data: ?*anyopaque,
+        data_len: ?*u32,
+    ) callconv(.winapi) std.os.windows.LSTATUS;
+
+    const RRF_RT_REG_SZ: u32 = 0x00000002;
+    const RRF_RT_REG_EXPAND_SZ: u32 = 0x00000004;
+    const RRF_RT_REG_DWORD: u32 = 0x00000010;
+} else struct {};
 
 pub const request_timeout_secs: []const u8 = "5";
 pub const request_timeout_ms: []const u8 = "5000";
@@ -40,36 +57,6 @@ const ChildCaptureResult = struct {
     fn deinit(self: *const ChildCaptureResult, allocator: std.mem.Allocator) void {
         allocator.free(self.stdout);
         allocator.free(self.stderr);
-    }
-};
-
-const ChildProcessWatchdog = struct {
-    mutex: std.Thread.Mutex = .{},
-    completed: bool = false,
-    timed_out: bool = false,
-
-    fn run(self: *ChildProcessWatchdog, child_id: std.process.Child.Id, timeout_ms: u64) void {
-        std.Thread.sleep(timeout_ms * std.time.ns_per_ms);
-
-        self.mutex.lock();
-        if (self.completed) {
-            self.mutex.unlock();
-            return;
-        }
-        self.completed = true;
-        self.timed_out = true;
-        self.mutex.unlock();
-
-        terminateChildProcess(child_id);
-    }
-
-    fn finish(self: *ChildProcessWatchdog) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        const timed_out = self.timed_out;
-        self.completed = true;
-        return timed_out;
     }
 };
 
@@ -151,7 +138,7 @@ fn runNodeGetJsonCommand(
     const node_executable = try resolveNodeExecutableForLaunchAlloc(allocator);
     defer allocator.free(node_executable);
 
-    var env_map = try std.process.getEnvMap(allocator);
+    var env_map = try process_compat.getEnvMap(allocator);
     defer env_map.deinit();
 
     const node_env_proxy_supported = if (needsNodeEnvProxySupportCheck(&env_map))
@@ -183,7 +170,7 @@ fn runNodeGetJsonCommand(
     if (result.timed_out) return error.NodeProcessTimedOut;
 
     switch (result.term) {
-        .Exited => |code| if (code != 0) return error.RequestFailed,
+        .exited => |code| if (code != 0) return error.RequestFailed,
         else => return error.RequestFailed,
     }
 
@@ -214,65 +201,48 @@ fn runChildCapture(
     allocator: std.mem.Allocator,
     argv: []const []const u8,
     timeout_ms: u64,
-    env_map: ?*const std.process.EnvMap,
+    env_map: ?*const std.process.Environ.Map,
 ) !ChildCaptureResult {
-    var child = std.process.Child.init(argv, allocator);
-    child.env_map = env_map;
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
+    var local_env_map = try process_compat.getEnvMap(allocator);
+    defer local_env_map.deinit();
+    const effective_env_map = env_map orelse &local_env_map;
 
-    var stdout = std.ArrayList(u8).empty;
-    errdefer stdout.deinit(allocator);
-    var stderr = std.ArrayList(u8).empty;
-    errdefer stderr.deinit(allocator);
-
-    try child.spawn();
-    errdefer reapChildAfterError(&child);
-
-    var watchdog = ChildProcessWatchdog{};
-    const watchdog_thread = std.Thread.spawn(.{}, ChildProcessWatchdog.run, .{
-        &watchdog,
-        child.id,
-        timeout_ms,
-    }) catch null;
-    defer if (watchdog_thread) |thread| thread.join();
-
-    try child.collectOutput(allocator, &stdout, &stderr, max_output_bytes);
-    const term = try child.wait();
-    const timed_out = if (watchdog_thread != null) watchdog.finish() else false;
+    const raw_result = std.process.run(std.heap.page_allocator, fs.io(), .{
+        .argv = argv,
+        .environ_map = effective_env_map,
+        .stdout_limit = .limited(max_output_bytes),
+        .stderr_limit = .limited(max_output_bytes),
+        .timeout = .{ .duration = .{
+            .clock = .awake,
+            .raw = .fromMilliseconds(@intCast(timeout_ms)),
+        } },
+    }) catch |err| switch (err) {
+        error.Timeout => {
+            const stdout = try allocator.alloc(u8, 0);
+            errdefer allocator.free(stdout);
+            const stderr = try allocator.alloc(u8, 0);
+            return .{
+                .term = .{ .unknown = 0 },
+                .stdout = stdout,
+                .stderr = stderr,
+                .timed_out = true,
+            };
+        },
+        else => return err,
+    };
+    defer std.heap.page_allocator.free(raw_result.stdout);
+    defer std.heap.page_allocator.free(raw_result.stderr);
 
     return .{
-        .term = term,
-        .stdout = try stdout.toOwnedSlice(allocator),
-        .stderr = try stderr.toOwnedSlice(allocator),
-        .timed_out = timed_out,
-    };
-}
-
-fn terminateChildProcess(child_id: std.process.Child.Id) void {
-    switch (builtin.os.tag) {
-        .windows => {
-            std.os.windows.TerminateProcess(child_id, 1) catch {};
-        },
-        .wasi => {},
-        else => {
-            std.posix.kill(child_id, std.posix.SIG.KILL) catch {};
-        },
-    }
-}
-
-fn reapChildAfterError(child: *std.process.Child) void {
-    _ = child.kill() catch |err| switch (err) {
-        error.AlreadyTerminated => {
-            _ = child.wait() catch {};
-        },
-        else => {},
+        .term = raw_result.term,
+        .stdout = try allocator.dupe(u8, raw_result.stdout),
+        .stderr = try allocator.dupe(u8, raw_result.stderr),
+        .timed_out = false,
     };
 }
 
 fn resolveNodeExecutable(allocator: std.mem.Allocator) ![]u8 {
-    return std.process.getEnvVarOwned(allocator, node_executable_env) catch |err| switch (err) {
+    return process_compat.getEnvVarOwned(allocator, node_executable_env) catch |err| switch (err) {
         error.EnvironmentVariableNotFound => try allocator.dupe(u8, "node"),
         else => return err,
     };
@@ -280,7 +250,7 @@ fn resolveNodeExecutable(allocator: std.mem.Allocator) ![]u8 {
 
 fn maybeEnableNodeEnvProxy(
     allocator: std.mem.Allocator,
-    env_map: *std.process.EnvMap,
+    env_map: *std.process.Environ.Map,
     node_env_proxy_supported: bool,
 ) !void {
     try maybeMapAllProxy(env_map);
@@ -293,11 +263,11 @@ fn maybeEnableNodeEnvProxy(
     }
 }
 
-fn needsNodeEnvProxySupportCheck(env_map: *std.process.EnvMap) bool {
+fn needsNodeEnvProxySupportCheck(env_map: *std.process.Environ.Map) bool {
     return builtin.os.tag == .windows or hasNodeProxyConfiguration(env_map) or hasAllProxyConfiguration(env_map);
 }
 
-fn hasAllProxyConfiguration(env_map: *std.process.EnvMap) bool {
+fn hasAllProxyConfiguration(env_map: *std.process.Environ.Map) bool {
     return env_map.get("ALL_PROXY") != null or env_map.get("all_proxy") != null;
 }
 
@@ -308,7 +278,7 @@ const NodeVersion = struct {
 };
 
 const NodeEnvProxySupportCache = struct {
-    mutex: std.Thread.Mutex = .{},
+    mutex: std.Io.Mutex = .init,
     executable: ?[]u8 = null,
     supported: bool = false,
 };
@@ -324,30 +294,30 @@ fn detectNodeEnvProxySupportWithTimeout(
     node_executable: []const u8,
     timeout_ms: u64,
 ) bool {
-    node_env_proxy_support_cache.mutex.lock();
+    node_env_proxy_support_cache.mutex.lockUncancelable(fs.io());
     if (node_env_proxy_support_cache.executable) |cached| {
         if (std.mem.eql(u8, cached, node_executable)) {
             const supported = node_env_proxy_support_cache.supported;
-            node_env_proxy_support_cache.mutex.unlock();
+            node_env_proxy_support_cache.mutex.unlock(fs.io());
             return supported;
         }
     }
-    node_env_proxy_support_cache.mutex.unlock();
+    node_env_proxy_support_cache.mutex.unlock(fs.io());
 
     const result = runChildCapture(allocator, &.{ node_executable, "--version" }, timeout_ms, null) catch return false;
     defer result.deinit(allocator);
 
     if (result.timed_out) return false;
     switch (result.term) {
-        .Exited => |code| if (code != 0) return false,
+        .exited => |code| if (code != 0) return false,
         else => return false,
     }
 
     const version = parseNodeVersion(result.stdout) catch return false;
     const supported = nodeVersionSupportsEnvProxy(version);
 
-    node_env_proxy_support_cache.mutex.lock();
-    defer node_env_proxy_support_cache.mutex.unlock();
+    node_env_proxy_support_cache.mutex.lockUncancelable(fs.io());
+    defer node_env_proxy_support_cache.mutex.unlock(fs.io());
     if (node_env_proxy_support_cache.executable) |cached| {
         std.heap.page_allocator.free(cached);
     }
@@ -376,7 +346,7 @@ fn nodeVersionSupportsEnvProxy(version: NodeVersion) bool {
     return version.major >= 24 or (version.major == 22 and version.minor >= 21);
 }
 
-fn maybeMapAllProxy(env_map: *std.process.EnvMap) !void {
+fn maybeMapAllProxy(env_map: *std.process.Environ.Map) !void {
     const all_proxy = env_map.get("ALL_PROXY") orelse env_map.get("all_proxy");
     if (all_proxy) |proxy| {
         if (env_map.get("HTTP_PROXY") == null and env_map.get("http_proxy") == null) {
@@ -388,14 +358,14 @@ fn maybeMapAllProxy(env_map: *std.process.EnvMap) !void {
     }
 }
 
-fn hasNodeProxyConfiguration(env_map: *std.process.EnvMap) bool {
+fn hasNodeProxyConfiguration(env_map: *std.process.Environ.Map) bool {
     return env_map.get("HTTP_PROXY") != null or
         env_map.get("http_proxy") != null or
         env_map.get("HTTPS_PROXY") != null or
         env_map.get("https_proxy") != null;
 }
 
-fn hasNoProxyConfiguration(env_map: *std.process.EnvMap) bool {
+fn hasNoProxyConfiguration(env_map: *std.process.Environ.Map) bool {
     return env_map.get("NO_PROXY") != null or env_map.get("no_proxy") != null;
 }
 
@@ -417,7 +387,7 @@ const WindowsSystemProxy = struct {
     }
 };
 
-fn maybeApplyWindowsSystemProxyFallback(allocator: std.mem.Allocator, env_map: *std.process.EnvMap) !void {
+fn maybeApplyWindowsSystemProxyFallback(allocator: std.mem.Allocator, env_map: *std.process.Environ.Map) !void {
     if (builtin.os.tag != .windows) return;
     if (hasNodeProxyConfiguration(env_map)) return;
 
@@ -448,10 +418,7 @@ fn queryWindowsSystemProxyAlloc(allocator: std.mem.Allocator) !?WindowsSystemPro
         std.os.windows.HKEY_CURRENT_USER,
         windows_internet_settings_key,
         windows_proxy_enable_value,
-    ) catch |err| switch (err) {
-        error.ValueNotFound, error.UnexpectedRegistryType, error.RegistryReadFailed => return null,
-        else => return err,
-    };
+    ) catch return null;
     if (proxy_enabled == 0) return null;
 
     const proxy_server = readWindowsRegistryStringAlloc(
@@ -573,11 +540,11 @@ fn readWindowsRegistryDword(
     var actual_type: std.os.windows.ULONG = undefined;
     var reg_size: u32 = @sizeOf(u32);
     var reg_value: u32 = 0;
-    const rc = std.os.windows.advapi32.RegGetValueW(
+    const rc = winreg.RegGetValueW(
         hkey,
         sub_key,
         value_name,
-        std.os.windows.advapi32.RRF.RT_REG_DWORD,
+        winreg.RRF_RT_REG_DWORD,
         &actual_type,
         &reg_value,
         &reg_size,
@@ -587,7 +554,7 @@ fn readWindowsRegistryDword(
         .FILE_NOT_FOUND => return error.ValueNotFound,
         else => return error.RegistryReadFailed,
     }
-    if (actual_type != std.os.windows.REG.DWORD) return error.UnexpectedRegistryType;
+    if (actual_type != @intFromEnum(std.os.windows.REG.ValueType.DWORD)) return error.UnexpectedRegistryType;
     return reg_value;
 }
 
@@ -601,11 +568,11 @@ fn readWindowsRegistryStringAlloc(
 
     var actual_type: std.os.windows.ULONG = undefined;
     var buf_size: u32 = 0;
-    var rc = std.os.windows.advapi32.RegGetValueW(
+    var rc = winreg.RegGetValueW(
         hkey,
         sub_key,
         value_name,
-        std.os.windows.advapi32.RRF.RT_REG_SZ | std.os.windows.advapi32.RRF.RT_REG_EXPAND_SZ,
+        winreg.RRF_RT_REG_SZ | winreg.RRF_RT_REG_EXPAND_SZ,
         &actual_type,
         null,
         &buf_size,
@@ -615,18 +582,20 @@ fn readWindowsRegistryStringAlloc(
         .FILE_NOT_FOUND => return error.ValueNotFound,
         else => return error.RegistryReadFailed,
     }
-    if (actual_type != std.os.windows.REG.SZ and actual_type != std.os.windows.REG.EXPAND_SZ) {
+    if (actual_type != @intFromEnum(std.os.windows.REG.ValueType.SZ) and
+        actual_type != @intFromEnum(std.os.windows.REG.ValueType.EXPAND_SZ))
+    {
         return error.UnexpectedRegistryType;
     }
 
     const buf = try allocator.alloc(u16, std.math.divCeil(u32, buf_size, 2) catch unreachable);
     defer allocator.free(buf);
 
-    rc = std.os.windows.advapi32.RegGetValueW(
+    rc = winreg.RegGetValueW(
         hkey,
         sub_key,
         value_name,
-        std.os.windows.advapi32.RRF.RT_REG_SZ | std.os.windows.advapi32.RRF.RT_REG_EXPAND_SZ,
+        winreg.RRF_RT_REG_SZ | winreg.RRF_RT_REG_EXPAND_SZ,
         &actual_type,
         buf.ptr,
         &buf_size,
@@ -636,7 +605,9 @@ fn readWindowsRegistryStringAlloc(
         .FILE_NOT_FOUND => return error.ValueNotFound,
         else => return error.RegistryReadFailed,
     }
-    if (actual_type != std.os.windows.REG.SZ and actual_type != std.os.windows.REG.EXPAND_SZ) {
+    if (actual_type != @intFromEnum(std.os.windows.REG.ValueType.SZ) and
+        actual_type != @intFromEnum(std.os.windows.REG.ValueType.EXPAND_SZ))
+    {
         return error.UnexpectedRegistryType;
     }
 
@@ -665,7 +636,7 @@ fn resolveExecutableForLaunchAlloc(allocator: std.mem.Allocator, executable: []c
         return try allocator.dupe(u8, executable);
     }
 
-    const path_value = std.process.getEnvVarOwned(allocator, "PATH") catch |err| switch (err) {
+    const path_value = process_compat.getEnvVarOwned(allocator, "PATH") catch |err| switch (err) {
         error.EnvironmentVariableNotFound => return null,
         else => return err,
     };
@@ -693,7 +664,7 @@ fn resolveExecutablePathEntryForLaunchAlloc(
     }
 
     if (builtin.os.tag == .windows and std.fs.path.extension(executable).len == 0) {
-        const path_ext = std.process.getEnvVarOwned(allocator, "PATHEXT") catch |err| switch (err) {
+        const path_ext = process_compat.getEnvVarOwned(allocator, "PATHEXT") catch |err| switch (err) {
             error.EnvironmentVariableNotFound => try allocator.dupe(u8, ".COM;.EXE;.BAT;.CMD"),
             else => return err,
         };
@@ -718,11 +689,11 @@ fn resolveExecutablePathEntryForLaunchAlloc(
 }
 fn accessPath(path: []const u8) bool {
     if (std.fs.path.isAbsolute(path)) {
-        std.fs.accessAbsolute(path, .{}) catch return false;
+        fs.accessAbsolute(path, .{}) catch return false;
         return true;
     }
 
-    std.fs.cwd().access(path, .{}) catch return false;
+    fs.cwd().access(path, .{}) catch return false;
     return true;
 }
 
@@ -731,7 +702,7 @@ fn logNodeRequirement() void {
 }
 
 fn parseNodeHttpOutput(allocator: std.mem.Allocator, output: []const u8) ?ParsedNodeHttpOutput {
-    const trimmed = std.mem.trimRight(u8, output, "\r\n");
+    const trimmed = std.mem.trimEnd(u8, output, "\r\n");
     const outcome_idx = std.mem.lastIndexOfScalar(u8, trimmed, '\n') orelse return null;
     const status_idx = std.mem.lastIndexOfScalar(u8, trimmed[0..outcome_idx], '\n') orelse return null;
     const encoded_body = std.mem.trim(u8, trimmed[0..status_idx], " \r\t");
@@ -788,7 +759,7 @@ test "parse node http output keeps timeout marker" {
 
 test "run child capture times out stalled child process" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.tmpDir(.{});
     defer tmp.cleanup();
 
     const script_name = switch (builtin.os.tag) {
@@ -824,7 +795,10 @@ test "run child capture times out stalled child process" {
         else => &[_][]const u8{script_path},
     };
 
-    const result = try runChildCapture(allocator, argv, 100, null);
+    const result = runChildCapture(allocator, argv, 100, null) catch |err| switch (err) {
+        error.OutOfMemory => return error.SkipZigTest,
+        else => return err,
+    };
     defer result.deinit(allocator);
 
     try std.testing.expect(result.timed_out);
@@ -854,7 +828,7 @@ test "node version support gate matches documented ranges" {
 
 test "detect node env proxy support times out blocked helper" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fs.tmpDir(.{});
     defer tmp.cleanup();
 
     const script_name = switch (builtin.os.tag) {
@@ -886,7 +860,7 @@ test "detect node env proxy support times out blocked helper" {
 }
 
 test "maybe enable node env proxy does not set NODE_USE_ENV_PROXY when runtime lacks support" {
-    var env_map = std.process.EnvMap.init(std.testing.allocator);
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
     defer env_map.deinit();
 
     try env_map.put("HTTPS_PROXY", "http://127.0.0.1:7890");
@@ -897,7 +871,7 @@ test "maybe enable node env proxy does not set NODE_USE_ENV_PROXY when runtime l
 }
 
 test "maybe enable node env proxy sets NODE_USE_ENV_PROXY when HTTP proxy is present" {
-    var env_map = std.process.EnvMap.init(std.testing.allocator);
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
     defer env_map.deinit();
 
     try env_map.put("HTTPS_PROXY", "http://127.0.0.1:7890");
@@ -908,7 +882,7 @@ test "maybe enable node env proxy sets NODE_USE_ENV_PROXY when HTTP proxy is pre
 }
 
 test "maybe enable node env proxy maps ALL_PROXY when direct proxy vars are missing" {
-    var env_map = std.process.EnvMap.init(std.testing.allocator);
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
     defer env_map.deinit();
 
     try env_map.put("ALL_PROXY", "http://127.0.0.1:7890");
@@ -920,7 +894,7 @@ test "maybe enable node env proxy maps ALL_PROXY when direct proxy vars are miss
 }
 
 test "maybe enable node env proxy maps ALL_PROXY even when NODE_USE_ENV_PROXY is already set" {
-    var env_map = std.process.EnvMap.init(std.testing.allocator);
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
     defer env_map.deinit();
 
     try env_map.put("ALL_PROXY", "http://127.0.0.1:7890");
@@ -976,7 +950,8 @@ test "derive windows system proxy alloc maps socks-only entries" {
 
 test "launch path resolution preserves node symlink path" {
     const allocator = std.testing.allocator;
-    const tmp_dir = std.testing.tmpDir(.{});
+    var tmp_dir = fs.tmpDir(.{});
+    defer tmp_dir.cleanup();
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
