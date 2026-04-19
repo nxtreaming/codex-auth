@@ -1,6 +1,5 @@
 const std = @import("std");
-const time_compat = @import("compat_time.zig");
-const fs = @import("compat_fs.zig");
+const app_runtime = @import("runtime.zig");
 const builtin = @import("builtin");
 const display_rows = @import("display_rows.zig");
 const registry = @import("registry.zig");
@@ -26,11 +25,19 @@ const ansi = struct {
 };
 
 fn colorEnabled() bool {
-    return fs.File.stdout().isTty();
+    return std.Io.File.stdout().isTty(app_runtime.io()) catch false;
 }
 
 fn stderrColorEnabled() bool {
-    return fs.File.stderr().isTty();
+    return std.Io.File.stderr().isTty(app_runtime.io()) catch false;
+}
+
+fn readFileOnce(file: std.Io.File, buffer: []u8) !usize {
+    var buffers = [_][]u8{buffer};
+    return file.readStreaming(app_runtime.io(), &buffers) catch |err| switch (err) {
+        error.EndOfStream => 0,
+        else => |e| return e,
+    };
 }
 
 pub const ApiMode = enum {
@@ -60,6 +67,7 @@ pub const SwitchOptions = struct {
 pub const RemoveOptions = struct {
     selectors: [][]const u8,
     all: bool,
+    api_mode: ApiMode = .default,
 };
 pub const CleanOptions = struct {};
 pub const AutoAction = enum { enable, disable };
@@ -346,16 +354,33 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Pars
         errdefer freeOwnedStringList(allocator, selectors.items);
         defer selectors.deinit(allocator);
         var all = false;
+        var api_mode: ApiMode = .default;
         var i: usize = 2;
         while (i < args.len) : (i += 1) {
             const arg = std.mem.sliceTo(args[i], 0);
-            if (std.mem.eql(u8, arg, "--api") or std.mem.eql(u8, arg, "--skip-api")) {
-                return usageErrorResult(
-                    allocator,
-                    .remove_account,
-                    "`remove` does not support `--api` or `--skip-api`.",
-                    .{},
-                );
+            if (std.mem.eql(u8, arg, "--api")) {
+                switch (api_mode) {
+                    .default => api_mode = .force_api,
+                    .force_api => {
+                        return usageErrorResult(allocator, .remove_account, "duplicate `--api` for `remove`.", .{});
+                    },
+                    .skip_api => {
+                        return usageErrorResult(allocator, .remove_account, "`--api` cannot be combined with `--skip-api` for `remove`.", .{});
+                    },
+                }
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--skip-api")) {
+                switch (api_mode) {
+                    .default => api_mode = .skip_api,
+                    .skip_api => {
+                        return usageErrorResult(allocator, .remove_account, "duplicate `--skip-api` for `remove`.", .{});
+                    },
+                    .force_api => {
+                        return usageErrorResult(allocator, .remove_account, "`--skip-api` cannot be combined with `--api` for `remove`.", .{});
+                    },
+                }
+                continue;
             }
             if (std.mem.eql(u8, arg, "--all")) {
                 if (all or selectors.items.len != 0) {
@@ -372,9 +397,19 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Pars
             }
             try selectors.append(allocator, try allocator.dupe(u8, arg));
         }
+        if (api_mode != .default and (all or selectors.items.len != 0)) {
+            freeOwnedStringList(allocator, selectors.items);
+            return usageErrorResult(
+                allocator,
+                .remove_account,
+                "`remove <query>` and `remove --all` do not support `--api` or `--skip-api`.",
+                .{},
+            );
+        }
         return .{ .command = .{ .remove_account = .{
             .selectors = try selectors.toOwnedSlice(allocator),
             .all = all,
+            .api_mode = api_mode,
         } } };
     }
 
@@ -808,7 +843,7 @@ fn writeUsageSection(out: *std.Io.Writer, topic: HelpTopic) !void {
             try out.writeAll("  codex-auth switch <query>\n");
         },
         .remove_account => {
-            try out.writeAll("  codex-auth remove\n");
+            try out.writeAll("  codex-auth remove [--api|--skip-api]\n");
             try out.writeAll("  codex-auth remove <query> [<query>...]\n");
             try out.writeAll("  codex-auth remove --all\n");
         },
@@ -861,6 +896,8 @@ fn writeExamplesSection(out: *std.Io.Writer, topic: HelpTopic) !void {
         },
         .remove_account => {
             try out.writeAll("  codex-auth remove\n");
+            try out.writeAll("  codex-auth remove --api\n");
+            try out.writeAll("  codex-auth remove --skip-api\n");
             try out.writeAll("  codex-auth remove 01 03\n");
             try out.writeAll("  codex-auth remove work personal\n");
             try out.writeAll("  codex-auth remove john@example.com jane@example.com\n");
@@ -880,7 +917,7 @@ fn writeExamplesSection(out: *std.Io.Writer, topic: HelpTopic) !void {
 
 pub fn printUsageError(usage_err: *const UsageError) !void {
     var buffer: [2048]u8 = undefined;
-    var writer = fs.File.stderr().writer(&buffer);
+    var writer = std.Io.File.stderr().writer(app_runtime.io(), &buffer);
     const out = &writer.interface;
     const use_color = stderrColorEnabled();
     try writeErrorPrefixTo(out, use_color);
@@ -919,7 +956,7 @@ pub fn printImportReport(report: *const registry.ImportReport) !void {
     var stdout: io_util.Stdout = undefined;
     stdout.init();
     var stderr_buffer: [4096]u8 = undefined;
-    var stderr_writer = fs.File.stderr().writer(&stderr_buffer);
+    var stderr_writer = std.Io.File.stderr().writer(app_runtime.io(), &stderr_buffer);
     try writeImportReport(stdout.out(), &stderr_writer.interface, report);
 }
 
@@ -988,7 +1025,7 @@ pub fn writeHintPrefixTo(out: *std.Io.Writer, use_color: bool) !void {
 
 pub fn printAccountNotFoundError(query: []const u8) !void {
     var buffer: [512]u8 = undefined;
-    var writer = fs.File.stderr().writer(&buffer);
+    var writer = std.Io.File.stderr().writer(app_runtime.io(), &buffer);
     const out = &writer.interface;
     const use_color = stderrColorEnabled();
     try writeErrorPrefixTo(out, use_color);
@@ -1003,7 +1040,7 @@ pub fn printAccountNotFoundErrors(queries: []const []const u8) !void {
     }
 
     var buffer: [1024]u8 = undefined;
-    var writer = fs.File.stderr().writer(&buffer);
+    var writer = std.Io.File.stderr().writer(app_runtime.io(), &buffer);
     const out = &writer.interface;
     const use_color = stderrColorEnabled();
     try writeErrorPrefixTo(out, use_color);
@@ -1018,7 +1055,7 @@ pub fn printAccountNotFoundErrors(queries: []const []const u8) !void {
 
 pub fn printRemoveRequiresTtyError() !void {
     var buffer: [512]u8 = undefined;
-    var writer = fs.File.stderr().writer(&buffer);
+    var writer = std.Io.File.stderr().writer(app_runtime.io(), &buffer);
     const out = &writer.interface;
     const use_color = stderrColorEnabled();
     try writeErrorPrefixTo(out, use_color);
@@ -1030,7 +1067,7 @@ pub fn printRemoveRequiresTtyError() !void {
 
 pub fn printInvalidRemoveSelectionError() !void {
     var buffer: [512]u8 = undefined;
-    var writer = fs.File.stderr().writer(&buffer);
+    var writer = std.Io.File.stderr().writer(app_runtime.io(), &buffer);
     const out = &writer.interface;
     const use_color = stderrColorEnabled();
     try writeErrorPrefixTo(out, use_color);
@@ -1092,7 +1129,7 @@ pub fn writeRemoveConfirmationTo(out: *std.Io.Writer, labels: []const []const u8
 
 pub fn printRemoveConfirmationUnavailableError(labels: []const []const u8) !void {
     var buffer: [1024]u8 = undefined;
-    var writer = fs.File.stderr().writer(&buffer);
+    var writer = std.Io.File.stderr().writer(app_runtime.io(), &buffer);
     const out = &writer.interface;
     const use_color = stderrColorEnabled();
     try writeMatchedAccountsListTo(out, labels);
@@ -1111,7 +1148,7 @@ pub fn confirmRemoveMatches(labels: []const []const u8) !bool {
     try out.flush();
 
     var buf: [64]u8 = undefined;
-    const n = try fs.File.stdin().read(&buf);
+    const n = try readFileOnce(std.Io.File.stdin(), &buf);
     const line = std.mem.trim(u8, buf[0..n], " \n\r\t");
     return line.len == 1 and (line[0] == 'y' or line[0] == 'Y');
 }
@@ -1135,7 +1172,7 @@ pub fn printRemoveSummary(labels: []const []const u8) !void {
 
 fn writeCodexLoginLaunchFailureHint(err_name: []const u8, use_color: bool) !void {
     var buffer: [512]u8 = undefined;
-    var writer = fs.File.stderr().writer(&buffer);
+    var writer = std.Io.File.stderr().writer(app_runtime.io(), &buffer);
     const out = &writer.interface;
     try writeCodexLoginLaunchFailureHintTo(out, err_name, use_color);
     try out.flush();
@@ -1173,7 +1210,7 @@ fn ensureCodexLoginSucceeded(term: std.process.Child.Term) !void {
 }
 
 pub fn runCodexLogin(opts: LoginOptions) !void {
-    var child = std.process.spawn(fs.io(), .{
+    var child = std.process.spawn(app_runtime.io(), .{
         .argv = codexLoginArgs(opts),
         .stdin = .inherit,
         .stdout = .inherit,
@@ -1182,7 +1219,7 @@ pub fn runCodexLogin(opts: LoginOptions) !void {
         writeCodexLoginLaunchFailureHint(@errorName(err), stderrColorEnabled()) catch {};
         return err;
     };
-    const term = child.wait(fs.io()) catch |err| {
+    const term = child.wait(app_runtime.io()) catch |err| {
         writeCodexLoginLaunchFailureHint(@errorName(err), stderrColorEnabled()) catch {};
         return err;
     };
@@ -1234,7 +1271,7 @@ pub fn selectAccountsToRemoveWithUsageOverrides(
     if (comptime builtin.os.tag == .windows) {
         return selectRemoveWithNumbers(allocator, reg, usage_overrides);
     }
-    if (shouldUseNumberedRemoveSelector(false, fs.File.stdin().isTty())) {
+    if (shouldUseNumberedRemoveSelector(false, std.Io.File.stdin().isTty(app_runtime.io()) catch false)) {
         return selectRemoveWithNumbers(allocator, reg, usage_overrides);
     }
     return selectRemoveInteractive(allocator, reg, usage_overrides) catch selectRemoveWithNumbers(allocator, reg, usage_overrides);
@@ -1292,7 +1329,7 @@ fn selectWithNumbers(
     try out.flush();
 
     var buf: [64]u8 = undefined;
-    const n = try fs.File.stdin().read(&buf);
+    const n = try readFileOnce(std.Io.File.stdin(), &buf);
     const line = std.mem.trim(u8, buf[0..n], " \n\r\t");
     if (line.len == 0) {
         if (active_idx) |i| return accountIdForSelectable(&rows, reg, i);
@@ -1328,7 +1365,7 @@ fn selectWithNumbersFromIndices(
     try out.flush();
 
     var buf: [64]u8 = undefined;
-    const n = try fs.File.stdin().read(&buf);
+    const n = try readFileOnce(std.Io.File.stdin(), &buf);
     const line = std.mem.trim(u8, buf[0..n], " \n\r\t");
     if (line.len == 0) {
         if (active_idx) |i| return accountIdForSelectable(&rows, reg, i);
@@ -1350,8 +1387,8 @@ fn selectInteractiveFromIndices(
     var rows = try buildSwitchRowsFromIndicesWithUsageOverrides(allocator, reg, indices, usage_overrides);
     defer rows.deinit(allocator);
 
-    var tty = try fs.cwd().openFile("/dev/tty", .{});
-    defer tty.close();
+    var tty = try std.Io.Dir.cwd().openFile(app_runtime.io(), "/dev/tty", .{});
+    defer tty.close(app_runtime.io());
 
     const term = try std.posix.tcgetattr(tty.handle);
     var raw = term;
@@ -1384,7 +1421,7 @@ fn selectInteractiveFromIndices(
         try out.flush();
 
         var b: [8]u8 = undefined;
-        const n = try tty.read(&b);
+        const n = try readFileOnce(tty, &b);
         var i: usize = 0;
         while (i < n) : (i += 1) {
             if (b[i] == 0x1b) {
@@ -1476,7 +1513,7 @@ fn selectRemoveWithNumbers(
     try out.flush();
 
     var buf: [256]u8 = undefined;
-    const n = try fs.File.stdin().read(&buf);
+    const n = try readFileOnce(std.Io.File.stdin(), &buf);
     const line = std.mem.trim(u8, buf[0..n], " \n\r\t");
     if (line.len == 0) return null;
     if (!isStrictRemoveSelectionLine(line)) return error.InvalidRemoveSelectionInput;
@@ -1533,8 +1570,8 @@ fn selectInteractive(
     var rows = try buildSwitchRowsWithUsageOverrides(allocator, reg, usage_overrides);
     defer rows.deinit(allocator);
 
-    var tty = try fs.cwd().openFile("/dev/tty", .{});
-    defer tty.close();
+    var tty = try std.Io.Dir.cwd().openFile(app_runtime.io(), "/dev/tty", .{});
+    defer tty.close(app_runtime.io());
 
     const term = try std.posix.tcgetattr(tty.handle);
     var raw = term;
@@ -1567,7 +1604,7 @@ fn selectInteractive(
         try out.flush();
 
         var b: [8]u8 = undefined;
-        const n = try tty.read(&b);
+        const n = try readFileOnce(tty, &b);
         var i: usize = 0;
         while (i < n) : (i += 1) {
             if (b[i] == 0x1b) {
@@ -1642,8 +1679,8 @@ fn selectRemoveInteractive(
     var rows = try buildSwitchRowsWithUsageOverrides(allocator, reg, usage_overrides);
     defer rows.deinit(allocator);
 
-    var tty = try fs.cwd().openFile("/dev/tty", .{});
-    defer tty.close();
+    var tty = try std.Io.Dir.cwd().openFile(app_runtime.io(), "/dev/tty", .{});
+    defer tty.close(app_runtime.io());
 
     const term = try std.posix.tcgetattr(tty.handle);
     var raw = term;
@@ -1679,7 +1716,7 @@ fn selectRemoveInteractive(
         try out.flush();
 
         var b: [8]u8 = undefined;
-        const n = try tty.read(&b);
+        const n = try readFileOnce(tty, &b);
         var i: usize = 0;
         while (i < n) : (i += 1) {
             if (b[i] == 0x1b) {
@@ -2045,7 +2082,7 @@ fn buildSwitchRowsWithUsageOverrides(
         .rate_week = "WEEKLY".len,
         .last = "LAST".len,
     };
-    const now = time_compat.timestamp();
+    const now = std.Io.Timestamp.now(app_runtime.io(), .real).toSeconds();
     for (display.rows, 0..) |display_row, i| {
         if (display_row.account_index) |account_idx| {
             const rec = reg.accounts.items[account_idx];
@@ -2121,7 +2158,7 @@ fn buildSwitchRowsFromIndicesWithUsageOverrides(
         .rate_week = "WEEKLY".len,
         .last = "LAST".len,
     };
-    const now = time_compat.timestamp();
+    const now = std.Io.Timestamp.now(app_runtime.io(), .real).toSeconds();
     for (display.rows, 0..) |display_row, i| {
         if (display_row.account_index) |account_idx| {
             const rec = reg.accounts.items[account_idx];
@@ -2187,7 +2224,7 @@ fn resolveRateWindow(usage: ?registry.RateLimitSnapshot, minutes: i64, fallback_
 fn formatRateLimitSwitchAlloc(allocator: std.mem.Allocator, window: ?registry.RateLimitWindow) ![]u8 {
     if (window == null) return try std.fmt.allocPrint(allocator, "-", .{});
     if (window.?.resets_at == null) return try std.fmt.allocPrint(allocator, "-", .{});
-    const now = time_compat.timestamp();
+    const now = std.Io.Timestamp.now(app_runtime.io(), .real).toSeconds();
     const reset_at = window.?.resets_at.?;
     if (now >= reset_at) {
         return try std.fmt.allocPrint(allocator, "100%", .{});
